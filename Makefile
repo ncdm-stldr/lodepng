@@ -9,8 +9,8 @@
 CC ?= gcc
 CXX ?= g++
 
-override CFLAGS := -W -Wall -Wextra -ansi -pedantic -O3 -Wno-unused-function $(CFLAGS)
-override CXXFLAGS := -W -Wall -Wextra -ansi -pedantic -O3 $(CXXFLAGS)
+override CFLAGS := -W -Wall -Wextra -ansi -pedantic -march=native -O3 -Wno-unused-function $(CFLAGS)
+override CXXFLAGS := -W -Wall -Wextra -ansi -pedantic -std=c++17 -march=native -O3 $(CXXFLAGS)
 
 all: unittest benchmark pngdetail showpng
 

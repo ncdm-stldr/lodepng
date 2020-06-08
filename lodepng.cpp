@@ -39,6 +39,13 @@ Rename this file to lodepng.cpp to use it for C++, or to lodepng.c to use it for
 #include <stdlib.h> /* allocations */
 #endif /* LODEPNG_COMPILE_ALLOCATORS */
 
+#ifdef __SSE2__
+#include <xmmintrin.h>
+#include <emmintrin.h>
+#include <smmintrin.h>
+#include <cstdlib>
+#endif
+
 #if defined(_MSC_VER) && (_MSC_VER >= 1310) /*Visual Studio: A few warning types are not desired here.*/
 #pragma warning( disable : 4244 ) /*implicit conversions: not warned by gcc -Wall -Wextra and requires too much casts*/
 #pragma warning( disable : 4996 ) /*VS does not like fopen, but fopen_s is not standard C so unusable here*/
@@ -76,6 +83,13 @@ static void* lodepng_malloc(size_t size) {
   if(size > LODEPNG_MAX_ALLOC) return 0;
 #endif
   return malloc(size);
+}
+
+static void* lodepng_malloc_16bytes_aligned(size_t size) {
+#ifdef LODEPNG_MAX_ALLOC
+  if(size > LODEPNG_MAX_ALLOC) return 0;
+#endif
+  return std::aligned_alloc(16, size);
 }
 
 /* NOTE: when realloc returns NULL, it leaves the original memory untouched */
@@ -5332,6 +5346,76 @@ static unsigned addChunk_iCCP(ucvector* out, const LodePNGInfo* info, LodePNGCom
 
 #endif /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
 
+#ifdef __SSE2__
+// Note: out must be 16 bytes aligned
+static void sse_filterScanline(u_int16_t* out, const unsigned char* scanline, const unsigned char* prevline,
+                           size_t length, size_t bytewidth, unsigned char filterType) {
+  size_t i;
+  switch(filterType) {
+    case 0: /*None*/
+      for(i = 0; i != length; ++i) out[i] = scanline[i];
+      break;
+    case 1: /*Sub*/
+      for(i = 0; i != bytewidth; ++i) out[i] = scanline[i];
+      
+      for(i = bytewidth; i < length; ++i){
+		  unsigned char tmp = scanline[i] - scanline[i - bytewidth];
+		  out[i] = (u_int16_t) tmp;
+	  }
+      break;
+    case 2: /*Up*/
+      if(prevline) {
+        for(i = 0; i != length; ++i){
+			unsigned char tmp = scanline[i] - prevline[i];
+			 out[i] = tmp;
+		 }
+      } else {
+        for(i = 0; i != length; ++i) out[i] = scanline[i];
+      }
+      break;
+    case 3: /*Average*/
+      if(prevline) {
+        for(i = 0; i != bytewidth; ++i){
+			 unsigned char tmp = scanline[i] - (prevline[i] >> 1);
+			 out[i] = tmp;
+		 }
+        for(i = bytewidth; i < length; ++i){
+			unsigned char tmp = scanline[i] - ((scanline[i - bytewidth] + prevline[i]) >> 1);
+			out[i] = tmp;
+		 }
+      } else {
+        for(i = 0; i != bytewidth; ++i) out[i] = scanline[i];
+        for(i = bytewidth; i < length; ++i){
+			 unsigned char tmp = scanline[i] - (scanline[i - bytewidth] >> 1);
+			 out[i] = tmp;
+		 }
+      }	
+      break;
+    case 4: /*Paeth*/
+      if(prevline) {
+        /*paethPredictor(0, prevline[i], 0) is always prevline[i]*/
+        for(i = 0; i != bytewidth; ++i){
+			 unsigned char tmp = (scanline[i] - prevline[i]);
+			 out[i] = tmp;
+		 }
+        for(i = bytewidth; i < length; ++i) {
+		  unsigned char tmp = (scanline[i] - paethPredictor(scanline[i - bytewidth], prevline[i], prevline[i - bytewidth]));
+          out[i] = tmp;
+        }
+      } else {
+        for(i = 0; i != bytewidth; ++i) out[i] = scanline[i];
+        /*paethPredictor(scanline[i - bytewidth], 0, 0) is always scanline[i - bytewidth]*/
+        for(i = bytewidth; i < length; ++i){
+			 unsigned char tmp = (scanline[i] - scanline[i - bytewidth]);
+			 out[i] = tmp;
+		 }
+      }
+      break;
+    default: return; /*invalid filter type given*/
+  }
+}
+#endif
+
 static void filterScanline(unsigned char* out, const unsigned char* scanline, const unsigned char* prevline,
                            size_t length, size_t bytewidth, unsigned char filterType) {
   size_t i;
@@ -5376,6 +5460,7 @@ static void filterScanline(unsigned char* out, const unsigned char* scanline, co
   }
 }
 
+
 /* integer binary logarithm, max return value is 31 */
 static size_t ilog2(size_t i) {
   size_t result = 0;
@@ -5396,6 +5481,102 @@ static size_t ilog2i(size_t i) {
   linearly approximates the missing fractional part multiplied by i */
   return i * l + ((i - (1u << l)) << 1u);
 }
+
+#ifdef __SSE2__
+// sum the chars of the array (using simd instructions)
+// warning: the 8 most significant bits of the elements must be set to 0
+//          otherwise overflows may occur
+size_t sse_sum_chars(u_int16_t* chars, size_t n){
+	
+	          size_t sum = 0;
+	          size_t x = 0;
+	          size_t end1 = n / 8 * 8; // todo better way
+			  size_t end2 = n;
+			  
+			  
+			  /* sum the elements using smid instructions */
+			  
+			  __m128i sums_8 = _mm_setzero_si128 ();
+			  u_int16_t counter = 0;
+			  for(x = 0; x < end1; x = x + 8) {
+				  /* perform 8 sums in parallel */
+				  __m128i _8x_16bits_elements = _mm_load_si128( (__m128i*) &chars[x] );
+				  sums_8 = _mm_hadd_epi16(sums_8, _8x_16bits_elements);
+				  if(counter++ >= 8 || x + 8 >= end1) { // todo find exact value
+					  counter = 0;
+					  u_int16_t* sums_8_array = (u_int16_t*) &sums_8;
+				      sum += sums_8_array[0];
+				      sum += sums_8_array[1];
+				      sum += sums_8_array[2];
+				      sum += sums_8_array[3];
+				      sum += sums_8_array[4];
+			    	  sum += sums_8_array[5];
+			    	  sum += sums_8_array[6];
+			    	  sum += sums_8_array[7];
+			    	  sums_8 = _mm_setzero_si128 ();
+				  }
+			  }
+			  
+			  /* sum the remaining elements */
+			  for(x = end1; x < end2; ++x) {
+				  sum += (unsigned char) chars[x];
+			  }
+			  
+			  
+			  return sum;
+	
+}
+
+// compute the following sum using simd instructions:
+// sum += c < 128 ? c : (255U - c);
+// for every character c of the chars array
+size_t sse_sum_chars_as_differences(u_int16_t* chars, size_t n){
+	
+	          size_t sum = 0;
+	          size_t x = 0;
+	          size_t end1 = n / 8 * 8; // todo better way
+			  size_t end2 = n;
+			  
+			  
+			  /* sum the elements using smid instructions */
+			  
+			  __m128i sums_8 = _mm_setzero_si128 ();
+			  u_int16_t counter = 0;
+			  
+			  for(x = 0; x < end1; x = x + 8) {
+				  /* perform 8 sums in parallel */
+				  __m128i values = _mm_load_si128( (__m128i*) &chars[x] );
+				  const __m128i zero = _mm_set_epi16(0, 0,
+				  0, 0, 0, 0, 0, 0);
+				  __m128i tmp = _mm_cmplt_epi8(values, zero);
+				  values = _mm_xor_si128(values, tmp);
+				  sums_8 = _mm_hadd_epi16(sums_8, values);
+				  
+				  if(counter++ >= 8 || x + 8 >= end1) { // todo find exact value
+					  counter = 0;
+					  u_int16_t* sums_8_array = (u_int16_t*) &sums_8;
+				      sum += sums_8_array[0];
+				      sum += sums_8_array[1];
+				      sum += sums_8_array[2];
+				      sum += sums_8_array[3];
+				      sum += sums_8_array[4];
+			    	  sum += sums_8_array[5];
+			    	  sum += sums_8_array[6];
+			    	  sum += sums_8_array[7];
+			    	  sums_8 = _mm_setzero_si128 ();
+				  }
+			  }
+			  
+			  /* sum the remaining elements */
+			  for(x = end1; x < end2; ++x) {
+				  sum += (unsigned char) chars[x];
+			  }
+			  
+			  
+			  return sum;
+	
+}
+#endif
 
 static unsigned filter(unsigned char* out, const unsigned char* in, unsigned w, unsigned h,
                        const LodePNGColorMode* color, const LodePNGEncoderSettings* settings) {
@@ -5445,12 +5626,21 @@ static unsigned filter(unsigned char* out, const unsigned char* in, unsigned w, 
     }
   } else if(strategy == LFS_MINSUM) {
     /*adaptive filtering*/
+    
+    #ifndef __SSE2__
     unsigned char* attempt[5]; /*five filtering attempts, one for each filter type*/
+    #else
+    u_int16_t* attempt[5]; /*five filtering attempts, one for each filter type*/
+    #endif
     size_t smallest = 0;
     unsigned char type, bestType = 0;
 
     for(type = 0; type != 5; ++type) {
+	  #ifndef __SSE2__
       attempt[type] = (unsigned char*)lodepng_malloc(linebytes);
+      #else
+      attempt[type] = (u_int16_t*) lodepng_malloc_16bytes_aligned(linebytes * sizeof(u_int16_t));
+      #endif
       if(!attempt[type]) error = 83; /*alloc fail*/
     }
 
@@ -5459,19 +5649,30 @@ static unsigned filter(unsigned char* out, const unsigned char* in, unsigned w, 
         /*try the 5 filter types*/
         for(type = 0; type != 5; ++type) {
           size_t sum = 0;
+          #ifndef __SSE2__
           filterScanline(attempt[type], &in[y * linebytes], prevline, linebytes, bytewidth, type);
-
+          #else
+          sse_filterScanline(attempt[type], &in[y * linebytes], prevline, linebytes, bytewidth, type);
+          #endif
           /*calculate the sum of the result*/
           if(type == 0) {
+			#ifndef __SSE2__
             for(x = 0; x != linebytes; ++x) sum += (unsigned char)(attempt[type][x]);
+            #else
+            sum = sse_sum_chars(attempt[type], linebytes);
+            #endif
           } else {
+			#ifndef __SSE2__
             for(x = 0; x != linebytes; ++x) {
               /*For differences, each byte should be treated as signed, values above 127 are negative
               (converted to signed char). Filtertype 0 isn't a difference though, so use unsigned there.
               This means filtertype 0 is almost never chosen, but that is justified.*/
-              unsigned char s = attempt[type][x];
+              unsigned char s = (unsigned char) attempt[type][x];
               sum += s < 128 ? s : (255U - s);
-            }
+              }
+             #else
+              sum = sse_sum_chars_as_differences(attempt[type], linebytes);
+             #endif
           }
 
           /*check if this is smallest sum (or if type == 0 it's the first case so always store the values)*/
@@ -5479,8 +5680,11 @@ static unsigned filter(unsigned char* out, const unsigned char* in, unsigned w, 
             bestType = type;
             smallest = sum;
           }
+          
+          
+          
         }
-
+        
         prevline = &in[y * linebytes];
 
         /*now fill the out values*/
